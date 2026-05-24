@@ -515,7 +515,7 @@ async def admin_reply_to_user(message: Message, bot: Bot):
         try:
             await bot.send_message(
                 chat_id=user_id,
-                text=f"<b>Ответ от руководства:</b>\n\n{message.text}"
+                text=f"Ответ от руководства:\n\n{message.text}"
             )
         except Exception as e:
             await message.reply(f"❌ Ошибка отправки пользователю: {e}")
@@ -569,7 +569,7 @@ async def handle_search(message: Message, state: FSMContext):
                 f"{E['eyes']} Проверенные админы: {admins_checked}\n"
                 f"{E['chart']} Оценка: <b>{rating}</b>\n"
                 f"{E['arrow']} Ссылка: {review_link}\n"
-                f"{E['calendar']} Дата: {dt}\n\n"
+                f"{E['green']} Оценка: {dt}\n\n"
             )
 
     await send_message(message.chat.id, text, reply_markup=back_keyboard())
