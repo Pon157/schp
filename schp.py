@@ -116,11 +116,11 @@ def init_db():
         )
     """)
     
-    # Пытаемся добавить колонку rating, если таблица была создана до обновления
+    # Добавляем колонку rating, если таблица была создана ранее без неё
     try:
         c.execute("ALTER TABLE reviews ADD COLUMN rating TEXT NOT NULL DEFAULT 'Не указана'")
     except sqlite3.OperationalError:
-        pass  # Колонка уже существует
+        pass
 
     conn.commit()
     conn.close()
@@ -196,7 +196,6 @@ _base_url = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 async def api_call(method: str, payload: dict) -> dict:
     url = f"{_base_url}/{method}"
-    # Используем прокси, если он задан в .env
     kwargs = {}
     if PROXY_URL:
         kwargs['proxy'] = PROXY_URL
@@ -355,7 +354,6 @@ async def cmd_start(message: Message, state: FSMContext):
 
 
 async def show_main_menu(chat_id):
-    """Вспомогательная функция для показа главного меню."""
     text = (
         f"{E['star']} <b>Главное меню</b>\n\n"
         f"{E['sparkles']} Здравствуйте, вы попали в бот канала\n"
@@ -410,7 +408,6 @@ async def handle_complaint_reason(message: Message, state: FSMContext):
     user_uname = f"@{user.username}" if user.username else "—"
     reason_text = message.caption or message.text or "—"
 
-    # Получить или создать топик для этого пользователя
     topic_id = get_user_topic(user.id)
     if not topic_id:
         topic_name = f"Жалоба | {user.full_name[:25]}"
@@ -470,7 +467,6 @@ async def handle_management_message(message: Message, state: FSMContext):
     user_uname = f"@{user.username}" if user.username else "—"
     msg_text = message.text or message.caption or "—"
 
-    # Проверяем, есть ли уже топик у юзера, иначе создаем
     topic_id = get_user_topic(user.id)
     if not topic_id:
         topic_name = f"Обращение | {user.full_name[:25]}"
@@ -512,18 +508,24 @@ async def admin_reply_to_user(message: Message, bot: Bot):
     if not message.message_thread_id:
         return
 
-    # Получаем user_id из нашей таблицы по topic_id
     user_id = get_user_by_topic(message.message_thread_id)
 
     if user_id:
+        # Сначала отправляем сообщение (основная логика)
         try:
             await bot.send_message(
                 chat_id=user_id,
                 text=f"<b>Ответ от руководства:</b>\n\n{message.text}"
             )
-            await message.react([ReactionTypeEmoji(emoji="✅")])
         except Exception as e:
             await message.reply(f"❌ Ошибка отправки пользователю: {e}")
+            return
+
+        # Пытаемся выставить реакцию. Если реакции в группе выключены, бот просто продолжит работу без ошибок
+        try:
+            await message.react(reactions=[ReactionTypeEmoji(emoji="✅")])
+        except Exception:
+            pass
 
 
 # ─── ПОИСК РЕЗУЛЬТАТОВ ПРОВЕРКИ ────────────────
@@ -730,7 +732,6 @@ async def main():
 
     http_session = aiohttp.ClientSession()
     
-    # Создаем сессию для aiogram с прокси, если он указан в .env
     kwargs = {}
     if PROXY_URL:
         kwargs['proxy'] = PROXY_URL
