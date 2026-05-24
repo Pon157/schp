@@ -10,17 +10,22 @@
 import asyncio
 import logging
 import sqlite3
+import os
 from datetime import datetime
 from typing import Optional
 
 import aiohttp
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, ReactionTypeEmoji
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.session.aiohttp import AiohttpSession
+
+# Загружаем переменные окружения из .env файла
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,19 +34,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ╔══════════════════════════════════════════════╗
-# ║                   CONFIG                     ║
+# ║                  CONFIG                    ║
 # ╚══════════════════════════════════════════════╝
-BOT_TOKEN = "8909998582:AAGk8SLLUE5NH9c6UPgq8KLJgrlX7E8ZMrE"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+PROXY_URL = os.getenv("PROXY_URL")
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не найден! Пожалуйста, добавьте его в файл .env")
+
 # Supergroup ID с включёнными темами (Topics/Forum)
 ADMIN_CHAT_ID = -1003536281255
 
 # ╔══════════════════════════════════════════════╗
-# ║              PROXY CONFIG                    ║
-# ╚══════════════════════════════════════════════╝
-PROXY_URL = "http://n6CZUF:Py0CSG@185.88.99.86:8000"
-
-# ╔══════════════════════════════════════════════╗
-# ║              PREMIUM EMOJI                   ║
+# ║              PREMIUM EMOJI                 ║
 # ╚══════════════════════════════════════════════╝
 def p_emoji(fallback: str, emoji_id: str) -> str:
     return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
@@ -105,10 +110,18 @@ def init_db():
             reviewers       TEXT NOT NULL,
             admins_checked  TEXT NOT NULL,
             review_link     TEXT NOT NULL,
+            rating          TEXT NOT NULL,
             added_by        INTEGER NOT NULL,
             added_at        TEXT NOT NULL
         )
     """)
+    
+    # Пытаемся добавить колонку rating, если таблица была создана до обновления
+    try:
+        c.execute("ALTER TABLE reviews ADD COLUMN rating TEXT NOT NULL DEFAULT 'Не указана'")
+    except sqlite3.OperationalError:
+        pass  # Колонка уже существует
+
     conn.commit()
     conn.close()
     logger.info("Database initialized")
@@ -118,6 +131,15 @@ def get_user_topic(user_id: int) -> Optional[int]:
     conn = sqlite3.connect("schp.db")
     c = conn.cursor()
     c.execute("SELECT topic_id FROM user_topics WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def get_user_by_topic(topic_id: int) -> Optional[int]:
+    conn = sqlite3.connect("schp.db")
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM user_topics WHERE topic_id = ?", (topic_id,))
     row = c.fetchone()
     conn.close()
     return row[0] if row else None
@@ -139,6 +161,7 @@ def db_add_review(
     reviewers: str,
     admins_checked: str,
     review_link: str,
+    rating: str,
     added_by: int,
 ):
     username = bot_username.lstrip("@").lower()
@@ -146,9 +169,9 @@ def db_add_review(
     c = conn.cursor()
     c.execute(
         """INSERT INTO reviews
-           (bot_username, reviewers, admins_checked, review_link, added_by, added_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (username, reviewers, admins_checked, review_link, added_by, datetime.now().isoformat()),
+           (bot_username, reviewers, admins_checked, review_link, rating, added_by, added_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (username, reviewers, admins_checked, review_link, rating, added_by, datetime.now().isoformat()),
     )
     conn.commit()
     conn.close()
@@ -173,7 +196,12 @@ _base_url = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 async def api_call(method: str, payload: dict) -> dict:
     url = f"{_base_url}/{method}"
-    async with http_session.post(url, json=payload, proxy=PROXY_URL) as resp:
+    # Используем прокси, если он задан в .env
+    kwargs = {}
+    if PROXY_URL:
+        kwargs['proxy'] = PROXY_URL
+        
+    async with http_session.post(url, json=payload, **kwargs) as resp:
         data = await resp.json()
         if not data.get("ok"):
             logger.warning("API %s failed: %s", method, data)
@@ -219,9 +247,6 @@ async def create_forum_topic(
     icon_emoji_id: Optional[str] = None,
 ) -> Optional[int]:
     payload = {"chat_id": str(chat_id), "name": name[:128]}
-    # НЕ передаем icon_emoji_id, чтобы не требовать Premium
-    # if icon_emoji_id:
-    #     payload["icon_custom_emoji_id"] = icon_emoji_id
     data = await api_call("createForumTopic", payload)
     if data.get("ok"):
         return data["result"]["message_thread_id"]
@@ -313,6 +338,7 @@ class AddReviewStates(StatesGroup):
     waiting_reviewers = State()
     waiting_admins = State()
     waiting_link = State()
+    waiting_rating = State()
 
 
 # ╔══════════════════════════════════════════════╗
@@ -325,16 +351,7 @@ router = Router()
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    text = (
-        f"{E['star']} <b>Добро пожаловать!</b>\n\n"
-        f"{E['sparkles']} Здравствуйте, вы попали в бот канала\n"
-        f"<b>СЧП — Самые Честные Проверки</b>\n\n"
-        f"Здесь вы можете:\n"
-        f"{E['pencil']} Подать жалобу на работу бота поддержки\n"
-        f"{E['flag']} Написать старшему руководству\n"
-        f"{E['chart']} Просмотреть и увидеть результаты проверки бота"
-    )
-    await send_message(message.chat.id, text, reply_markup=main_keyboard())
+    await show_main_menu(message.chat.id)
 
 
 async def show_main_menu(chat_id):
@@ -393,15 +410,11 @@ async def handle_complaint_reason(message: Message, state: FSMContext):
     user_uname = f"@{user.username}" if user.username else "—"
     reason_text = message.caption or message.text or "—"
 
-    # Получить или создать топик для этого пользователя (без премиум иконки)
+    # Получить или создать топик для этого пользователя
     topic_id = get_user_topic(user.id)
     if not topic_id:
         topic_name = f"Жалоба | {user.full_name[:25]}"
-        topic_id = await create_forum_topic(
-            ADMIN_CHAT_ID,
-            topic_name,
-            # icon_emoji_id убран - теперь не требует Premium
-        )
+        topic_id = await create_forum_topic(ADMIN_CHAT_ID, topic_name)
         if topic_id:
             set_user_topic(user.id, topic_id)
 
@@ -416,7 +429,6 @@ async def handle_complaint_reason(message: Message, state: FSMContext):
         f"{E['pencil']} <b>Причина:</b>\n{reason_text}"
     )
 
-    # Отправить в чат администраторов
     if topic_id:
         if message.photo:
             await send_photo(
@@ -439,6 +451,18 @@ async def handle_complaint_reason(message: Message, state: FSMContext):
 
 
 # ─── ОБРАЩЕНИЕ К РУКОВОДСТВУ ───────────────────
+@router.callback_query(F.data == "management")
+async def cb_management(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(ManagementStates.waiting_message)
+    text = (
+        f"{E['flag']} <b>Связь с руководством</b>\n\n"
+        f"{E['pencil']} Напишите ваше сообщение, и оно будет передано старшему руководству.\n\n"
+        f"<i>Вы можете отправить текст или фото с подписью.</i>"
+    )
+    await send_message(callback.message.chat.id, text, reply_markup=cancel_keyboard())
+
+
 @router.message(ManagementStates.waiting_message)
 async def handle_management_message(message: Message, state: FSMContext):
     user = message.from_user
@@ -446,15 +470,15 @@ async def handle_management_message(message: Message, state: FSMContext):
     user_uname = f"@{user.username}" if user.username else "—"
     msg_text = message.text or message.caption or "—"
 
-    # Создаем топик
-    topic_name = f"Обращение | {user.full_name[:25]}"
-    new_topic_id = await create_forum_topic(ADMIN_CHAT_ID, topic_name)
+    # Проверяем, есть ли уже топик у юзера, иначе создаем
+    topic_id = get_user_topic(user.id)
+    if not topic_id:
+        topic_name = f"Обращение | {user.full_name[:25]}"
+        topic_id = await create_forum_topic(ADMIN_CHAT_ID, topic_name)
+        if topic_id:
+            set_user_topic(user.id, topic_id)
 
-    if new_topic_id:
-        # ВАЖНО: Сохраняем связь в БД!
-        # Пример: await db.execute("INSERT INTO support_topics (topic_id, user_id) VALUES (?, ?)", (new_topic_id, user.id))
-        await save_topic_to_db(new_topic_id, user.id)
-
+    if topic_id:
         admin_text = (
             f"{E['flag']} <b>ОБРАЩЕНИЕ К РУКОВОДСТВУ</b>\n"
             f"{'─' * 30}\n"
@@ -464,7 +488,15 @@ async def handle_management_message(message: Message, state: FSMContext):
             f"{'─' * 30}\n"
             f"{E['pencil']} <b>Сообщение:</b>\n{msg_text}"
         )
-        await send_message(ADMIN_CHAT_ID, admin_text, message_thread_id=new_topic_id)
+        if message.photo:
+            await send_photo(
+                ADMIN_CHAT_ID,
+                message.photo[-1].file_id,
+                caption=admin_text,
+                message_thread_id=topic_id,
+            )
+        else:
+            await send_message(ADMIN_CHAT_ID, admin_text, message_thread_id=topic_id)
 
     await state.clear()
     confirm = (
@@ -474,23 +506,22 @@ async def handle_management_message(message: Message, state: FSMContext):
     )
     await send_message(message.chat.id, confirm, reply_markup=back_keyboard())
 
+
 @router.message(F.chat.id == ADMIN_CHAT_ID)
-async def admin_reply_to_user(message: Message):
-    # Если сообщение не в топике или админ пишет в основной чат — игнорируем
+async def admin_reply_to_user(message: Message, bot: Bot):
     if not message.message_thread_id:
         return
 
     # Получаем user_id из нашей таблицы по topic_id
-    user_id = await get_user_id_by_topic(message.message_thread_id)
+    user_id = get_user_by_topic(message.message_thread_id)
 
     if user_id:
         try:
-            # Отправляем ответ пользователю
             await bot.send_message(
                 chat_id=user_id,
                 text=f"<b>Ответ от руководства:</b>\n\n{message.text}"
             )
-            await message.react([ReactionTypeEmoji(emoji="✅")]) # Реакция, что отправилось
+            await message.react([ReactionTypeEmoji(emoji="✅")])
         except Exception as e:
             await message.reply(f"❌ Ошибка отправки пользователю: {e}")
 
@@ -524,15 +555,17 @@ async def handle_search(message: Message, state: FSMContext):
     else:
         text = f"{E['chart']} <b>Результаты проверки @{username}</b>\n{'─' * 30}\n\n"
         for i, rev in enumerate(reviews, 1):
-            _, _uname, reviewers, admins_checked, review_link, _added_by, added_at = rev
+            _, _uname, reviewers, admins_checked, review_link, rating, _added_by, added_at = rev
             try:
                 dt = datetime.fromisoformat(added_at).strftime("%d.%m.%Y %H:%M")
             except Exception:
                 dt = added_at
+                
             text += (
                 f"{E['star']} <b>Проверка #{i}</b>\n"
                 f"{E['user']} Проверяющие: {reviewers}\n"
                 f"{E['eyes']} Проверенные админы: {admins_checked}\n"
+                f"{E['chart']} Оценка: <b>{rating}</b>\n"
                 f"{E['arrow']} Ссылка: {review_link}\n"
                 f"{E['calendar']} Дата: {dt}\n\n"
             )
@@ -543,18 +576,17 @@ async def handle_search(message: Message, state: FSMContext):
 # ─── /add — ДОБАВЛЕНИЕ ПРОВЕРКИ (ТОЛЬКО В АДМИН-ЧАТЕ) ─
 @router.message(Command("add"))
 async def cmd_add(message: Message, state: FSMContext):
-    # Команда работает только в чате администраторов
     if message.chat.id != ADMIN_CHAT_ID and message.chat.type != "private":
         return
 
     args = message.text.split(None, 1)
 
-    # Однострочный синтаксис: /add @bot | проверяющие | проверенные | ссылка
+    # Однострочный синтаксис: /add @bot | проверяющие | проверенные | ссылка | оценка
     if len(args) > 1:
         parts = [p.strip() for p in args[1].split("|")]
-        if len(parts) >= 4:
-            bot_uname, reviewers, admins, link = parts[0], parts[1], parts[2], parts[3]
-            db_add_review(bot_uname, reviewers, admins, link, message.from_user.id)
+        if len(parts) >= 5:
+            bot_uname, reviewers, admins, link, rating = parts[0], parts[1], parts[2], parts[3], parts[4]
+            db_add_review(bot_uname, reviewers, admins, link, rating, message.from_user.id)
             clean_uname = bot_uname.lstrip("@")
             await send_message(
                 message.chat.id,
@@ -562,13 +594,14 @@ async def cmd_add(message: Message, state: FSMContext):
                 f"{E['tag']} Бот: <b>@{clean_uname}</b>\n"
                 f"{E['user']} Проверяющие: {reviewers}\n"
                 f"{E['eyes']} Проверенные: {admins}\n"
+                f"{E['chart']} Оценка: <b>{rating}</b>\n"
                 f"{E['arrow']} Ссылка: {link}",
             )
             return
         else:
             await send_message(
                 message.chat.id,
-                f"{E['warn']} Формат: /add @бот | проверяющие | проверенные_админы | ссылка",
+                f"{E['warn']} Формат: /add @бот | проверяющие | проверенные | ссылка | оценка",
             )
             return
 
@@ -576,7 +609,7 @@ async def cmd_add(message: Message, state: FSMContext):
     await state.set_state(AddReviewStates.waiting_bot_username)
     await send_message(
         message.chat.id,
-        f"{E['pencil']} <b>Добавление проверки (шаг 1/4)</b>\n\n"
+        f"{E['pencil']} <b>Добавление проверки (шаг 1/5)</b>\n\n"
         f"{E['tag']} Введите юзернейм бота:",
     )
 
@@ -587,7 +620,7 @@ async def add_step_username(message: Message, state: FSMContext):
     await state.set_state(AddReviewStates.waiting_reviewers)
     await send_message(
         message.chat.id,
-        f"{E['user']} <b>Шаг 2/4</b> — Введите имена проверяющих:",
+        f"{E['user']} <b>Шаг 2/5</b> — Введите имена проверяющих:",
     )
 
 
@@ -597,7 +630,7 @@ async def add_step_reviewers(message: Message, state: FSMContext):
     await state.set_state(AddReviewStates.waiting_admins)
     await send_message(
         message.chat.id,
-        f"{E['eyes']} <b>Шаг 3/4</b> — Введите проверенных администраторов:",
+        f"{E['eyes']} <b>Шаг 3/5</b> — Введите проверенных администраторов:",
     )
 
 
@@ -607,19 +640,31 @@ async def add_step_admins(message: Message, state: FSMContext):
     await state.set_state(AddReviewStates.waiting_link)
     await send_message(
         message.chat.id,
-        f"{E['arrow']} <b>Шаг 4/4</b> — Введите ссылку на проверку:",
+        f"{E['arrow']} <b>Шаг 4/5</b> — Введите ссылку на проверку:",
     )
 
 
 @router.message(AddReviewStates.waiting_link)
 async def add_step_link(message: Message, state: FSMContext):
+    await state.update_data(link=message.text.strip())
+    await state.set_state(AddReviewStates.waiting_rating)
+    await send_message(
+        message.chat.id,
+        f"{E['chart']} <b>Шаг 5/5</b> — Введите оценку (например, 10/10):",
+    )
+
+
+@router.message(AddReviewStates.waiting_rating)
+async def add_step_rating(message: Message, state: FSMContext):
     data = await state.get_data()
-    link = message.text.strip()
+    rating = message.text.strip()
+    
     db_add_review(
         data["bot_username"],
         data["reviewers"],
         data["admins"],
-        link,
+        data["link"],
+        rating,
         message.from_user.id,
     )
     await state.clear()
@@ -632,7 +677,8 @@ async def add_step_link(message: Message, state: FSMContext):
         f"{E['tag']} Бот: <b>@{clean_uname}</b>\n"
         f"{E['user']} Проверяющие: {data['reviewers']}\n"
         f"{E['eyes']} Проверенные: {data['admins']}\n"
-        f"{E['arrow']} Ссылка: {link}",
+        f"{E['chart']} Оценка: <b>{rating}</b>\n"
+        f"{E['arrow']} Ссылка: {data['link']}",
     )
 
 
@@ -682,18 +728,23 @@ async def main():
 
     init_db()
 
-    # Создаем aiohttp сессию с прокси для raw API
     http_session = aiohttp.ClientSession()
     
-    # Создаем сессию для aiogram с прокси
-    aiogram_session = AiohttpSession(proxy=PROXY_URL)
+    # Создаем сессию для aiogram с прокси, если он указан в .env
+    kwargs = {}
+    if PROXY_URL:
+        kwargs['proxy'] = PROXY_URL
     
-    # Создаем бота с сессией, которая использует прокси
+    aiogram_session = AiohttpSession(**kwargs)
+    
     bot = Bot(token=BOT_TOKEN, session=aiogram_session)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("🚀 СЧП Bot запущен через прокси %s", PROXY_URL)
+    if PROXY_URL:
+        logger.info("🚀 СЧП Bot запущен через прокси %s", PROXY_URL)
+    else:
+        logger.info("🚀 СЧП Bot запущен (без прокси)")
 
     try:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
@@ -704,4 +755,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    asyncio.run(main())
